@@ -10,4 +10,5 @@ pypdf
 python-docx
 python-multipart
 python-dotenv
+PyJWT
 sentence-transformers

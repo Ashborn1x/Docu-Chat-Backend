@@ -35,7 +35,27 @@ The backend loads environment variables from:
 1. `python-backend/.env`
 2. project root `.env`
 
-Create `python-backend/.env` if you want backend-specific values.
+Create `python-backend/.env` if you want backend-specific values. You can start from `python-backend/.env.example`.
+
+### General app settings
+
+- `APP_ENV=development`
+- `API_TITLE=RAG Backend API`
+- `ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173`
+- `DEFAULT_TOP_K=4`
+
+### Auth and security
+
+- `REQUIRE_AUTH=false`
+- `SUPABASE_URL`
+- `SUPABASE_ANON_KEY`
+- `SUPABASE_JWT_SECRET`
+- `SUPABASE_JWT_ALGORITHM=HS256`
+- `RATE_LIMIT_PER_MINUTE=30`
+- `MAX_UPLOAD_SIZE_MB=20`
+- `ALLOWED_UPLOAD_EXTENSIONS=pdf,csv,docx,txt`
+
+With `REQUIRE_AUTH=true`, protected routes require a Bearer token and the backend expects a confirmed email in the token claims.
 
 ### Groq profile
 

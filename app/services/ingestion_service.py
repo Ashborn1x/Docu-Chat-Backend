@@ -79,7 +79,9 @@ class IngestionService:
         self.upload_root = BACKEND_ROOT / "data" / "uploads"
         self.upload_root.mkdir(parents=True, exist_ok=True)
 
-    def create_document(self, upload: UploadFile, provider: str) -> dict[str, Any]:
+    def create_document(
+        self, upload: UploadFile, provider: str, user_id: str
+    ) -> dict[str, Any]:
         document_id = uuid4().hex
         safe_name = _slugify_filename(upload.filename or "document")
         target_path = self.upload_root / f"{document_id}-{safe_name}"
@@ -89,6 +91,7 @@ class IngestionService:
         created_at = _utc_now()
         document = {
             "id": document_id,
+            "user_id": user_id,
             "filename": upload.filename or safe_name,
             "stored_path": str(target_path),
             "provider": provider,
@@ -130,26 +133,39 @@ class IngestionService:
         return self._serialize_document(document)
 
     def list_documents(self) -> list[DocumentPipeline]:
+        return self.list_documents_for_user(None)
+
+    def list_documents_for_user(self, user_id: str | None) -> list[DocumentPipeline]:
         with self._lock:
             documents = sorted(
-                self._documents.values(),
+                (
+                    item
+                    for item in self._documents.values()
+                    if user_id is None or item["user_id"] == user_id
+                ),
                 key=lambda item: item["created_at"],
                 reverse=True,
             )
             return [self._serialize_document(item) for item in documents]
 
-    def get_document(self, document_id: str) -> DocumentPipeline:
+    def get_document(self, document_id: str, user_id: str | None = None) -> DocumentPipeline:
         with self._lock:
             document = self._documents.get(document_id)
-            if not document:
+            if not document or (user_id is not None and document["user_id"] != user_id):
                 raise KeyError(document_id)
             return self._serialize_document(document)
 
-    def get_chunks(self, document_id: str) -> DocumentChunkList:
+    def get_chunks(
+        self, document_id: str, user_id: str | None = None
+    ) -> DocumentChunkList:
         with self._lock:
             document = self._documents.get(document_id)
             chunks = self._chunks.get(document_id)
-            if not document or chunks is None:
+            if (
+                not document
+                or chunks is None
+                or (user_id is not None and document["user_id"] != user_id)
+            ):
                 raise KeyError(document_id)
 
             return DocumentChunkList(
@@ -158,11 +174,11 @@ class IngestionService:
                 chunks=[DocumentChunk(**chunk) for chunk in chunks],
             )
 
-    def delete_document(self, document_id: str) -> None:
+    def delete_document(self, document_id: str, user_id: str | None = None) -> None:
         with self._lock:
             document = self._documents.get(document_id)
             chunks = list(self._chunks.get(document_id, []))
-            if not document:
+            if not document or (user_id is not None and document["user_id"] != user_id):
                 raise KeyError(document_id)
 
             provider = document["provider"]

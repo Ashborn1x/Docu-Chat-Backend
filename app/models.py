@@ -56,6 +56,7 @@ class PartitionCounts(BaseModel):
 
 class DocumentPipeline(BaseModel):
     id: str
+    user_id: str
     filename: str
     provider: str
     status: str

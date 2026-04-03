@@ -14,6 +14,12 @@ EMBEDDING_MODEL_NAME = os.getenv(
     "EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2"
 )
 AI_PROVIDER = os.getenv("AI_PROVIDER", "groq").strip().lower()
+APP_ENV = os.getenv("APP_ENV", "development").strip().lower()
+REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "false").strip().lower() == "true"
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "").strip()
+SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "").strip()
+SUPABASE_JWT_ALGORITHM = os.getenv("SUPABASE_JWT_ALGORITHM", "HS256").strip()
 GROQ_MODEL_NAME = os.getenv("GROQ_MODEL_NAME", "groq/compound-mini")
 GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
 GEMINI_EMBEDDING_MODEL_NAME = os.getenv(
@@ -21,6 +27,13 @@ GEMINI_EMBEDDING_MODEL_NAME = os.getenv(
 )
 DEFAULT_TOP_K = int(os.getenv("DEFAULT_TOP_K", "4"))
 API_TITLE = os.getenv("API_TITLE", "RAG Backend API")
+RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "30"))
+MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "20"))
+ALLOWED_UPLOAD_EXTENSIONS = {
+    extension.strip().lower()
+    for extension in os.getenv("ALLOWED_UPLOAD_EXTENSIONS", "pdf,csv,docx,txt").split(",")
+    if extension.strip()
+}
 
 
 def get_allowed_origins() -> list[str]:
