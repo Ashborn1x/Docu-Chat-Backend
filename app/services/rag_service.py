@@ -1,6 +1,5 @@
 import asyncio
 import json
-import os
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
@@ -13,8 +12,14 @@ from langchain_huggingface import HuggingFaceEmbeddings
 
 from ..config import (
     DEFAULT_TOP_K,
+    GEMINI_EMBEDDING_MODEL_NAME,
+    GEMINI_MODEL_NAME,
     GROQ_MODEL_NAME,
+    get_chroma_collection_name,
     get_db_candidates,
+    get_gemini_api_keys,
+    get_groq_api_keys,
+    normalize_ai_provider,
     resolve_embedding_model,
 )
 
@@ -65,41 +70,184 @@ def _build_sources(docs: list[Document]) -> list[dict[str, Any]]:
     return sources
 
 
-class RagService:
-    def __init__(self) -> None:
-        if not os.getenv("GROQ_API_KEY"):
-            raise EnvironmentError("Missing GROQ_API_KEY in environment.")
+def _content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text", "")))
+        return "\n".join(part for part in parts if part).strip()
+    return str(content or "").strip()
 
-        embedding_model_name, local_only = resolve_embedding_model()
-        self.embedding_model = HuggingFaceEmbeddings(
+
+class RotatingChatModel:
+    def __init__(self, models: list[Any], provider: str) -> None:
+        self._models = models
+        self.provider = provider
+
+    def invoke(self, messages: list[Any]) -> str:
+        errors: list[str] = []
+        for index, model in enumerate(self._models, start=1):
+            try:
+                result = model.invoke(messages)
+                text = _content_to_text(getattr(result, "content", result))
+                if text:
+                    return text
+                raise RuntimeError("Model returned an empty response.")
+            except Exception as exc:
+                errors.append(f"key {index}: {exc}")
+
+        joined = "; ".join(errors) if errors else "no configured API keys"
+        raise RuntimeError(
+            f"All {self.provider} API keys failed during generation: {joined}"
+        )
+
+
+class RotatingEmbeddings:
+    def __init__(self, clients: list[Any], provider: str, model_name: str) -> None:
+        self._clients = clients
+        self.provider = provider
+        self.model_name = model_name
+
+    def _invoke(self, method_name: str, payload: Any) -> Any:
+        errors: list[str] = []
+        for index, client in enumerate(self._clients, start=1):
+            try:
+                return getattr(client, method_name)(payload)
+            except Exception as exc:
+                errors.append(f"key {index}: {exc}")
+
+        joined = "; ".join(errors) if errors else "no configured API keys"
+        raise RuntimeError(
+            f"All {self.provider} API keys failed during embedding: {joined}"
+        )
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self._invoke("embed_documents", texts)
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._invoke("embed_query", text)
+
+
+def build_embeddings_for_provider(provider: str | None = None) -> tuple[Any, str, str]:
+    resolved_provider = normalize_ai_provider(provider)
+    if resolved_provider == "gemini":
+        api_keys = get_gemini_api_keys()
+        if not api_keys:
+            raise EnvironmentError(
+                "Missing Gemini API keys. Set GOOGLE_API_KEY, GEMINI_API_KEY, "
+                "GOOGLE_API_KEYS, or GEMINI_API_KEYS."
+            )
+
+        from langchain_google_genai import GoogleGenerativeAIEmbeddings
+
+        clients = [
+            GoogleGenerativeAIEmbeddings(
+                model=GEMINI_EMBEDDING_MODEL_NAME,
+                google_api_key=api_key,
+            )
+            for api_key in api_keys
+        ]
+        return (
+            RotatingEmbeddings(
+                clients=clients,
+                provider="gemini",
+                model_name=GEMINI_EMBEDDING_MODEL_NAME,
+            ),
+            GEMINI_EMBEDDING_MODEL_NAME,
+            "gemini",
+        )
+
+    embedding_model_name, local_only = resolve_embedding_model()
+    return (
+        HuggingFaceEmbeddings(
             model_name=embedding_model_name,
             model_kwargs={"device": "cpu", "local_files_only": local_only},
             encode_kwargs={"normalize_embeddings": True},
-        )
+        ),
+        embedding_model_name,
+        "huggingface",
+    )
+
+
+class RagService:
+    def __init__(self, provider: str | None = None) -> None:
+        self.provider = normalize_ai_provider(provider)
+        self.collection_name = get_chroma_collection_name(self.provider)
+        (
+            self.embedding_model,
+            self.embedding_model_name,
+            self.embedding_provider,
+        ) = build_embeddings_for_provider(self.provider)
         self.db_path = self._resolve_db_path()
-        self.db = Chroma(
-            persist_directory=str(self.db_path),
+        self.db = self._open_db(self.db_path)
+        self.llm, self.chat_model_name = self._build_chat_model()
+
+    def _build_embeddings(self) -> tuple[Any, str]:
+        embedding_model, embedding_model_name, _ = build_embeddings_for_provider(
+            self.provider
+        )
+        return embedding_model, embedding_model_name
+
+    def _build_chat_model(self) -> tuple[RotatingChatModel, str]:
+        if self.provider == "gemini":
+            api_keys = get_gemini_api_keys()
+            if not api_keys:
+                raise EnvironmentError(
+                    "Missing Gemini API keys. Set GOOGLE_API_KEY, GEMINI_API_KEY, "
+                    "GOOGLE_API_KEYS, or GEMINI_API_KEYS."
+                )
+
+            from langchain_google_genai import ChatGoogleGenerativeAI
+
+            models = [
+                ChatGoogleGenerativeAI(
+                    model=GEMINI_MODEL_NAME,
+                    temperature=0,
+                    google_api_key=api_key,
+                )
+                for api_key in api_keys
+            ]
+            return RotatingChatModel(models=models, provider="gemini"), GEMINI_MODEL_NAME
+
+        api_keys = get_groq_api_keys()
+        if not api_keys:
+            raise EnvironmentError(
+                "Missing GROQ API keys. Set GROQ_API_KEY or GROQ_API_KEYS."
+            )
+
+        models = [
+            ChatGroq(model=GROQ_MODEL_NAME, temperature=0, api_key=api_key)
+            for api_key in api_keys
+        ]
+        return RotatingChatModel(models=models, provider="groq"), GROQ_MODEL_NAME
+
+    def _open_db(self, candidate):
+        return Chroma(
+            persist_directory=str(candidate),
             embedding_function=self.embedding_model,
+            collection_name=self.collection_name,
             collection_metadata={"hnsw:space": "cosine"},
         )
-        self.llm = ChatGroq(model=GROQ_MODEL_NAME, temperature=0)
 
     def _resolve_db_path(self):
         for candidate in get_db_candidates():
             if not candidate.exists():
                 continue
 
-            db = Chroma(
-                persist_directory=str(candidate),
-                embedding_function=self.embedding_model,
-                collection_metadata={"hnsw:space": "cosine"},
-            )
+            db = self._open_db(candidate)
             if db._collection.count() > 0:
                 return candidate
 
         searched = ", ".join(str(path) for path in get_db_candidates())
         raise FileNotFoundError(
-            f"No populated Chroma database found. Checked: {searched}"
+            "No populated Chroma database found for "
+            f"collection '{self.collection_name}'. Checked: {searched}. "
+            "If you switched embedding providers, re-index the documents for the new collection."
         )
 
     def _rewrite_question(self, question: str, history: list[dict[str, str]]) -> str:
@@ -127,8 +275,7 @@ class RagService:
 
         messages.append(HumanMessage(content=question))
         try:
-            result = self.llm.invoke(messages)
-            rewritten = (result.content or "").strip()
+            rewritten = self.llm.invoke(messages).strip()
             return rewritten or question
         except Exception:
             return question
@@ -156,7 +303,10 @@ class RagService:
         )
 
     def ask(
-        self, question: str, history: list[dict[str, str]] | None = None, top_k: int = DEFAULT_TOP_K
+        self,
+        question: str,
+        history: list[dict[str, str]] | None = None,
+        top_k: int = DEFAULT_TOP_K,
     ) -> ChatResult:
         clean_question = question.strip()
         if not clean_question:
@@ -169,7 +319,7 @@ class RagService:
 
         prompt = self._answer_prompt(clean_question, docs)
         try:
-            answer = self.llm.invoke([HumanMessage(content=prompt)]).content
+            answer = self.llm.invoke([HumanMessage(content=prompt)])
         except Exception:
             fallback_lines = [
                 "Generation is currently unavailable, so here are the most relevant retrieved passages:",
@@ -187,12 +337,20 @@ class RagService:
         )
 
 
-@lru_cache(maxsize=1)
-def get_rag_service() -> RagService:
-    return RagService()
+@lru_cache(maxsize=4)
+def get_rag_service(provider: str | None = None) -> RagService:
+    return RagService(provider=provider)
 
 
 async def ask_async(
-    question: str, history: list[dict[str, str]] | None = None, top_k: int = DEFAULT_TOP_K
+    question: str,
+    history: list[dict[str, str]] | None = None,
+    top_k: int = DEFAULT_TOP_K,
+    provider: str | None = None,
 ) -> ChatResult:
-    return await asyncio.to_thread(get_rag_service().ask, question, history, top_k)
+    return await asyncio.to_thread(
+        get_rag_service(provider).ask,
+        question,
+        history,
+        top_k,
+    )

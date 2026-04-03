@@ -3,7 +3,11 @@ uvicorn
 chromadb
 langchain-chroma
 langchain-core
+langchain-google-genai
 langchain-groq
 langchain-huggingface
+pypdf
+python-docx
+python-multipart
 python-dotenv
 sentence-transformers

@@ -8,6 +8,8 @@ Phase 1 backend for the React frontend.
 - `POST /api/chat`
 - `GET /health`
 - CORS enabled for local React development
+- Provider profiles for `groq` and `gemini`
+- API key failover for chat and embedding requests
 - Reuses the parent project's Chroma databases from:
   - `../dbv2/chroma_db`
   - `../dbv1/chroma_db`
@@ -15,10 +17,10 @@ Phase 1 backend for the React frontend.
 
 ## Run
 
-From the repository root:
+From the `python-backend` directory:
 
 ```powershell
-.\venv\Scripts\python.exe -m uvicorn backend.app.main:app --reload --host 0.0.0.0 --port 8000
+python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 Open:
@@ -30,12 +32,75 @@ Open:
 
 The backend loads environment variables from:
 
-1. `backend/.env`
-2. root `.env`
+1. `python-backend/.env`
+2. project root `.env`
 
-Copy `.env.example` to `backend/.env` if you want backend-specific values.
+Create `python-backend/.env` if you want backend-specific values.
 
-The Phase 1 backend is configured for Groq:
+### Groq profile
 
 - `GROQ_API_KEY`
+- `GROQ_API_KEYS`
 - `GROQ_MODEL_NAME=groq/compound-mini`
+
+With `AI_PROVIDER=groq`, the backend uses:
+
+- Groq for chat generation
+- local HuggingFace embeddings for retrieval
+
+### Gemini profile
+
+- `AI_PROVIDER=gemini`
+- `GOOGLE_API_KEY` or `GEMINI_API_KEY`
+- `GOOGLE_API_KEYS` or `GEMINI_API_KEYS`
+- `GEMINI_MODEL_NAME`
+- `GEMINI_EMBEDDING_MODEL_NAME`
+
+With `AI_PROVIDER=gemini`, the backend uses Gemini for both chat and embeddings.
+
+## Per-Request Provider Selection
+
+The backend default provider still comes from `AI_PROVIDER`, but clients can override it per request.
+
+Example chat payload:
+
+```json
+{
+  "question": "Summarize the policy",
+  "history": [],
+  "top_k": 4,
+  "provider": "gemini"
+}
+```
+
+Valid values:
+
+- `groq`
+- `gemini`
+
+You can also inspect a specific provider profile through health:
+
+```text
+GET /health?provider=groq
+GET /health?provider=gemini
+```
+
+## Multi-Key Failover
+
+You can provide multiple API keys as a comma-separated list:
+
+- `GROQ_API_KEYS=key1,key2,key3`
+- `GOOGLE_API_KEYS=key1,key2,key3`
+
+When a request fails with one key, the backend automatically retries with the next configured key.
+
+## Important Note About Chroma
+
+Switching from HuggingFace embeddings to Gemini embeddings changes the vector space. That means an existing Chroma collection created for the Groq profile cannot be reused safely for the Gemini profile.
+
+If you switch to `AI_PROVIDER=gemini`, re-index the documents into a Gemini-backed collection. By default the app uses:
+
+- `langchain` for the Groq profile
+- `rag-gemini` for the Gemini profile
+
+You can override this with `CHROMA_COLLECTION_NAME`.
