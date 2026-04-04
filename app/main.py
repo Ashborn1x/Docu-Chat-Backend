@@ -26,12 +26,16 @@ from .config import (
 from .models import (
     ChatRequest,
     ChatResponse,
+    ChatSession,
+    ChatSessionRename,
     DocumentChunkList,
     DocumentPipeline,
     HealthResponse,
 )
+from .services.chat_service import get_chat_persistence_service
 from .services.ingestion_service import get_ingestion_service
 from .services.rag_service import ask_async, get_rag_service
+from .services.supabase_service import get_supabase_service
 from .security import build_rate_limit_key, rate_limiter
 
 app = FastAPI(title=API_TITLE, version="0.1.0")
@@ -124,11 +128,27 @@ async def chat(
     try:
         _enforce_rate_limit(request, current_user, "chat")
         provider = normalize_ai_provider(payload.provider)
+        chat_store = get_chat_persistence_service()
+        session_id, history = chat_store.get_history_for_session(
+            payload.session_id,
+            current_user,
+            [item.model_dump() for item in payload.history],
+        )
         result = await ask_async(
             question=payload.question,
-            history=[item.model_dump() for item in payload.history],
+            history=history,
             top_k=payload.top_k,
             provider=provider,
+            user_id=current_user.id,
+        )
+        persisted_session_id = chat_store.persist_chat_round(
+            session_id=session_id,
+            current_user=current_user,
+            provider=provider,
+            question=payload.question.strip(),
+            answer=result.answer,
+            rewritten_query=result.rewritten_query,
+            model_name=get_rag_service(provider).chat_model_name,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -138,10 +158,41 @@ async def chat(
         raise HTTPException(status_code=500, detail="Unexpected chat error.") from exc
 
     return ChatResponse(
+        session_id=persisted_session_id,
         answer=result.answer,
         rewritten_query=result.rewritten_query,
         sources=result.sources,
     )
+
+
+@app.get("/api/chats", response_model=list[ChatSession])
+def list_chats(
+    request: Request,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    _enforce_rate_limit(request, current_user, "chats-list")
+    return get_chat_persistence_service().list_chats(current_user)
+
+
+@app.delete("/api/chats/{session_id}", status_code=204)
+def delete_chat(
+    session_id: str,
+    request: Request,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    _enforce_rate_limit(request, current_user, "chats-delete")
+    get_chat_persistence_service().delete_chat(session_id, current_user)
+
+
+@app.patch("/api/chats/{session_id}", status_code=204)
+def rename_chat(
+    session_id: str,
+    payload: ChatSessionRename,
+    request: Request,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    _enforce_rate_limit(request, current_user, "chats-rename")
+    get_chat_persistence_service().rename_chat(session_id, current_user, payload.title)
 
 
 @app.get("/api/documents", response_model=list[DocumentPipeline])
@@ -150,6 +201,7 @@ def list_documents(
     current_user: CurrentUser = Depends(get_current_user),
 ):
     _enforce_rate_limit(request, current_user, "documents-list")
+    get_supabase_service().ensure_user(current_user.id, current_user.email)
     return get_ingestion_service().list_documents_for_user(current_user.id)
 
 
@@ -204,6 +256,7 @@ async def upload_document(
         _enforce_rate_limit(request, current_user, "documents-upload")
         _validate_upload(file)
         normalized_provider = normalize_ai_provider(provider)
+        get_supabase_service().ensure_user(current_user.id, current_user.email)
         document = get_ingestion_service().create_document(
             file,
             normalized_provider,

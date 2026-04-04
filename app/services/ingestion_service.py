@@ -1,19 +1,24 @@
 import csv
 import json
 import re
-from datetime import UTC, datetime
 from pathlib import Path
-from threading import RLock
+from tempfile import NamedTemporaryFile
 from typing import Any
-from uuid import uuid4
 
 from fastapi import UploadFile
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 
-from ..config import BACKEND_ROOT, get_chroma_collection_name, get_primary_db_path
-from ..models import DocumentChunk, DocumentChunkList, DocumentPipeline, PartitionCounts
+from ..config import (
+    BACKEND_ROOT,
+    SUPABASE_STORAGE_BUCKET,
+    USE_SUPABASE_VECTORS,
+    get_chroma_collection_name,
+    get_primary_db_path,
+)
+from ..models import DocumentChunkList, DocumentPipeline, PartitionCounts
 from .rag_service import build_embeddings_for_provider, get_rag_service
+from .supabase_service import get_supabase_service, new_uuid, utc_now
 
 
 STAGE_DEFINITIONS = [
@@ -24,21 +29,6 @@ STAGE_DEFINITIONS = [
     ("summarisation", "Summarisation"),
     ("vectorization", "Vectorization & Storage"),
 ]
-
-
-def _utc_now() -> str:
-    return datetime.now(UTC).isoformat()
-
-
-def _stage_dict(key: str, label: str, status: str = "pending") -> dict[str, Any]:
-    return {
-        "key": key,
-        "label": label,
-        "status": status,
-        "detail": None,
-        "progress_current": 0,
-        "progress_total": 0,
-    }
 
 
 def _slugify_filename(filename: str) -> str:
@@ -73,196 +63,230 @@ def _summarize_text(text: str) -> str:
 
 class IngestionService:
     def __init__(self) -> None:
-        self._lock = RLock()
-        self._documents: dict[str, dict[str, Any]] = {}
-        self._chunks: dict[str, list[dict[str, Any]]] = {}
-        self.upload_root = BACKEND_ROOT / "data" / "uploads"
-        self.upload_root.mkdir(parents=True, exist_ok=True)
+        self.temp_root = BACKEND_ROOT / "data" / "tmp"
+        self.temp_root.mkdir(parents=True, exist_ok=True)
+        self.supabase = get_supabase_service()
 
     def create_document(
         self, upload: UploadFile, provider: str, user_id: str
-    ) -> dict[str, Any]:
-        document_id = uuid4().hex
+    ) -> DocumentPipeline:
+        document_id = new_uuid()
         safe_name = _slugify_filename(upload.filename or "document")
-        target_path = self.upload_root / f"{document_id}-{safe_name}"
         file_bytes = upload.file.read()
-        target_path.write_bytes(file_bytes)
+        content_type = upload.content_type or "application/octet-stream"
+        created_at = utc_now()
+        storage_key = f"{user_id}/{document_id}/{safe_name}"
 
-        created_at = _utc_now()
-        document = {
-            "id": document_id,
-            "user_id": user_id,
-            "filename": upload.filename or safe_name,
-            "stored_path": str(target_path),
-            "provider": provider,
-            "status": "queued",
-            "current_stage": "queued",
-            "file_size": len(file_bytes),
-            "created_at": created_at,
-            "updated_at": created_at,
-            "error": None,
-            "stages": [
-                _stage_dict("upload", "Upload to S3", "completed"),
-                _stage_dict("queued", "Queued", "running"),
-                _stage_dict("partitioning", "Partitioning"),
-                _stage_dict("chunking", "Chunking"),
-                _stage_dict("summarisation", "Summarisation"),
-                _stage_dict("vectorization", "Vectorization & Storage"),
-            ],
-            "partition_counts": {
-                "text_sections": 0,
-                "tables": 0,
-                "images": 0,
-                "titles_headers": 0,
-                "other_elements": 0,
-            },
-            "atomic_elements": 0,
-            "chunk_count": 0,
-            "summary_count": 0,
-            "vectorized_count": 0,
-            "detail_log": [
-                f"[{created_at}] Uploaded {upload.filename or safe_name}",
-                f"[{created_at}] Stored at {target_path}",
-            ],
-        }
-
-        with self._lock:
-            self._documents[document_id] = document
-            self._chunks[document_id] = []
-
-        return self._serialize_document(document)
-
-    def list_documents(self) -> list[DocumentPipeline]:
-        return self.list_documents_for_user(None)
+        self.supabase.upload_file(storage_key, file_bytes, content_type)
+        document = self.supabase.insert_document(
+            {
+                "id": document_id,
+                "user_id": user_id,
+                "filename": upload.filename or safe_name,
+                "storage_key": storage_key,
+                "storage_bucket": SUPABASE_STORAGE_BUCKET,
+                "file_size": len(file_bytes),
+                "content_type": content_type,
+                "provider": provider,
+                "status": "queued",
+                "current_stage": "queued",
+                "error_message": None,
+                "created_at": created_at,
+                "updated_at": created_at,
+            }
+        )
+        self.supabase.insert_document_event(
+            document_id=document_id,
+            stage_key="upload",
+            stage_label="Upload to S3",
+            status="completed",
+            detail=f"Uploaded {upload.filename or safe_name} to Supabase Storage.",
+            progress_current=1,
+            progress_total=1,
+        )
+        self.supabase.insert_document_event(
+            document_id=document_id,
+            stage_key="queued",
+            stage_label="Queued",
+            status="running",
+            detail="Document queued for processing.",
+            progress_current=0,
+            progress_total=0,
+        )
+        return self._build_pipeline_from_row(document)
 
     def list_documents_for_user(self, user_id: str | None) -> list[DocumentPipeline]:
-        with self._lock:
-            documents = sorted(
-                (
-                    item
-                    for item in self._documents.values()
-                    if user_id is None or item["user_id"] == user_id
-                ),
-                key=lambda item: item["created_at"],
-                reverse=True,
+        if not user_id:
+            return []
+        documents = self.supabase.list_documents(user_id)
+        events_by_document = self._events_by_document([document["id"] for document in documents])
+        chunk_counts = self._chunks_by_document([document["id"] for document in documents])
+        return [
+            self.supabase.build_document_pipeline(
+                document,
+                events_by_document.get(document["id"], []),
+                chunk_counts.get(document["id"], []),
             )
-            return [self._serialize_document(item) for item in documents]
+            for document in documents
+        ]
 
     def get_document(self, document_id: str, user_id: str | None = None) -> DocumentPipeline:
-        with self._lock:
-            document = self._documents.get(document_id)
-            if not document or (user_id is not None and document["user_id"] != user_id):
-                raise KeyError(document_id)
-            return self._serialize_document(document)
+        if not user_id:
+            raise KeyError(document_id)
+        document = self.supabase.get_document(document_id, user_id)
+        if not document:
+            raise KeyError(document_id)
+        return self._build_pipeline_from_row(document)
 
     def get_chunks(
         self, document_id: str, user_id: str | None = None
     ) -> DocumentChunkList:
-        with self._lock:
-            document = self._documents.get(document_id)
-            chunks = self._chunks.get(document_id)
-            if (
-                not document
-                or chunks is None
-                or (user_id is not None and document["user_id"] != user_id)
-            ):
-                raise KeyError(document_id)
-
-            return DocumentChunkList(
-                document_id=document_id,
-                filename=document["filename"],
-                chunks=[DocumentChunk(**chunk) for chunk in chunks],
-            )
+        if not user_id:
+            raise KeyError(document_id)
+        document = self.supabase.get_document(document_id, user_id)
+        if not document:
+            raise KeyError(document_id)
+        chunks = self.supabase.list_document_chunks(document_id)
+        return self.supabase.build_document_chunk_list(document, chunks)
 
     def delete_document(self, document_id: str, user_id: str | None = None) -> None:
-        with self._lock:
-            document = self._documents.get(document_id)
-            chunks = list(self._chunks.get(document_id, []))
-            if not document or (user_id is not None and document["user_id"] != user_id):
-                raise KeyError(document_id)
+        if not user_id:
+            raise KeyError(document_id)
+        document = self.supabase.get_document(document_id, user_id)
+        if not document:
+            raise KeyError(document_id)
 
-            provider = document["provider"]
-            stored_path = Path(document["stored_path"])
-            chunk_ids = [f"{document_id}:{chunk['chunk_index']}" for chunk in chunks]
-
-            self._documents.pop(document_id, None)
-            self._chunks.pop(document_id, None)
-
-        if chunk_ids:
-            embeddings, _, _ = build_embeddings_for_provider(provider)
+        chunks = self.supabase.list_document_chunks(document_id)
+        chunk_ids = [chunk.get("vector_id") for chunk in chunks if chunk.get("vector_id")]
+        if chunk_ids and not USE_SUPABASE_VECTORS:
+            embeddings, _, _ = build_embeddings_for_provider(document["provider"])
             vector_store = Chroma(
                 persist_directory=str(get_primary_db_path()),
                 embedding_function=embeddings,
-                collection_name=get_chroma_collection_name(provider),
+                collection_name=get_chroma_collection_name(document["provider"]),
                 collection_metadata={"hnsw:space": "cosine"},
             )
             vector_store.delete(ids=chunk_ids)
 
-        if stored_path.exists():
-            stored_path.unlink()
-
+        self.supabase.delete_file(document["storage_key"])
+        self.supabase.delete_document(document_id, user_id)
         get_rag_service.cache_clear()
 
     def process_document(self, document_id: str) -> None:
+        document = None
         try:
-            self._mark_stage(document_id, "queued", "completed", "Waiting slot cleared")
-            self._mark_stage(document_id, "partitioning", "running", "Processing and extracting text, images, and tables")
-            elements, counts = self._partition_document(document_id)
-            self._finalize_partitioning(document_id, counts, len(elements))
+            document = self._find_document_any_owner(document_id)
+            if not document:
+                return
 
-            self._mark_stage(document_id, "chunking", "running", "Creating semantic chunks")
-            chunks = self._chunk_elements(document_id, elements)
-            self._finalize_chunking(document_id, len(elements), len(chunks))
+            self._mark_stage(document, "queued", "completed", "Waiting slot cleared")
+            self._mark_stage(
+                document,
+                "partitioning",
+                "running",
+                "Processing and extracting text, images, and tables",
+            )
+            elements, counts = self._partition_document(document)
+            self._mark_stage(
+                document,
+                "partitioning",
+                "completed",
+                f"Partitioned into {len(elements)} atomic elements",
+                progress_current=len(elements),
+                progress_total=len(elements),
+            )
 
-            self._mark_stage(document_id, "summarisation", "running", "Creating chunk summaries")
-            self._summarize_chunks(document_id)
+            self._mark_stage(document, "chunking", "running", "Creating semantic chunks")
+            chunks = self._chunk_elements(elements)
+            self._mark_stage(
+                document,
+                "chunking",
+                "completed",
+                f"Chunked {len(elements)} elements into {len(chunks)} chunks",
+                progress_current=len(chunks),
+                progress_total=len(chunks),
+            )
 
-            self._mark_stage(document_id, "vectorization", "running", "Embedding and storing chunks")
-            self._vectorize_document(document_id)
+            self._mark_stage(document, "summarisation", "running", "Creating chunk summaries")
+            self._summarize_chunks(document, chunks)
+            self._mark_stage(
+                document,
+                "summarisation",
+                "completed",
+                f"Summarised {len(chunks)} chunks",
+                progress_current=len(chunks),
+                progress_total=len(chunks),
+            )
 
-            with self._lock:
-                document = self._documents[document_id]
-                document["status"] = "ready"
-                document["current_stage"] = "view_chunks"
-                document["updated_at"] = _utc_now()
-                document["detail_log"].append(
-                    f"[{document['updated_at']}] Pipeline completed successfully"
-                )
+            self._mark_stage(
+                document,
+                "vectorization",
+                "running",
+                "Embedding and storing chunks",
+                progress_current=0,
+                progress_total=len(chunks),
+            )
+            self._vectorize_document(document, chunks)
+            self._mark_stage(
+                document,
+                "vectorization",
+                "completed",
+                f"Stored {len(chunks)} chunks in collection '{get_chroma_collection_name(document['provider'])}'",
+                progress_current=len(chunks),
+                progress_total=len(chunks),
+            )
+
+            self.supabase.update_document(
+                document["id"],
+                document["user_id"],
+                {
+                    "status": "ready",
+                    "current_stage": "view_chunks",
+                    "error_message": None,
+                },
+            )
         except Exception as exc:
-            with self._lock:
-                document = self._documents[document_id]
-                document["status"] = "failed"
-                document["error"] = str(exc)
-                document["updated_at"] = _utc_now()
-                document["detail_log"].append(
-                    f"[{document['updated_at']}] Pipeline failed: {exc}"
+            if document:
+                self.supabase.update_document(
+                    document["id"],
+                    document["user_id"],
+                    {
+                        "status": "failed",
+                        "current_stage": document.get("current_stage", "queued"),
+                        "error_message": str(exc),
+                    },
                 )
-                current_key = document["current_stage"]
-                self._set_stage_locked(
-                    document,
-                    current_key,
+                self.supabase.insert_document_event(
+                    document_id=document["id"],
+                    stage_key=document.get("current_stage", "queued"),
+                    stage_label=self._stage_label(document.get("current_stage", "queued")),
                     status="failed",
                     detail=str(exc),
                 )
 
     def _partition_document(
-        self, document_id: str
+        self, document: dict[str, Any]
     ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-        with self._lock:
-            document = self._documents[document_id]
-            path = Path(document["stored_path"])
+        suffix = Path(document["filename"]).suffix.lower()
+        file_bytes = self.supabase.download_file(document["storage_key"])
+        with NamedTemporaryFile(
+            suffix=suffix or ".bin",
+            dir=self.temp_root,
+            delete=False,
+        ) as handle:
+            handle.write(file_bytes)
+            temp_path = Path(handle.name)
 
-        suffix = path.suffix.lower()
-        if suffix == ".pdf":
-            elements, counts = self._partition_pdf(path)
-        elif suffix == ".csv":
-            elements, counts = self._partition_csv(path)
-        elif suffix == ".docx":
-            elements, counts = self._partition_docx(path)
-        else:
-            elements, counts = self._partition_text(path)
-
-        return elements, counts
+        try:
+            if suffix == ".pdf":
+                return self._partition_pdf(temp_path)
+            if suffix == ".csv":
+                return self._partition_csv(temp_path)
+            if suffix == ".docx":
+                return self._partition_docx(temp_path)
+            return self._partition_text(temp_path)
+        finally:
+            temp_path.unlink(missing_ok=True)
 
     def _partition_pdf(self, path: Path) -> tuple[list[dict[str, Any]], dict[str, int]]:
         from pypdf import PdfReader
@@ -276,12 +300,8 @@ class IngestionService:
                 continue
             page_elements = _extract_paragraphs(text, page=page_index)
             elements.extend(page_elements)
-            counts.text_sections += sum(
-                1 for item in page_elements if item["kind"] == "text"
-            )
-            counts.titles_headers += sum(
-                1 for item in page_elements if item["kind"] == "header"
-            )
+            counts.text_sections += sum(1 for item in page_elements if item["kind"] == "text")
+            counts.titles_headers += sum(1 for item in page_elements if item["kind"] == "header")
 
         return elements, counts.model_dump()
 
@@ -322,29 +342,7 @@ class IngestionService:
         )
         return elements, counts.model_dump()
 
-    def _finalize_partitioning(
-        self, document_id: str, counts: dict[str, int], atomic_elements: int
-    ) -> None:
-        with self._lock:
-            document = self._documents[document_id]
-            document["partition_counts"] = counts
-            document["atomic_elements"] = atomic_elements
-            document["updated_at"] = _utc_now()
-            document["detail_log"].append(
-                f"[{document['updated_at']}] Partitioned into {atomic_elements} atomic elements"
-            )
-            self._set_stage_locked(
-                document,
-                "partitioning",
-                status="completed",
-                detail="Step completed successfully",
-                progress_current=atomic_elements,
-                progress_total=atomic_elements,
-            )
-
-    def _chunk_elements(
-        self, document_id: str, elements: list[dict[str, Any]], target_size: int = 1400
-    ) -> list[dict[str, Any]]:
+    def _chunk_elements(self, elements: list[dict[str, Any]], target_size: int = 1400) -> list[dict[str, Any]]:
         chunks: list[dict[str, Any]] = []
         current_parts: list[dict[str, Any]] = []
         current_length = 0
@@ -356,7 +354,7 @@ class IngestionService:
 
             projected = current_length + len(content) + 2
             if current_parts and projected > target_size:
-                chunks.append(self._build_chunk(chunks, current_parts))
+                chunks.append(self._build_chunk(len(chunks), current_parts))
                 current_parts = []
                 current_length = 0
 
@@ -364,20 +362,14 @@ class IngestionService:
             current_length += len(content) + 2
 
         if current_parts:
-            chunks.append(self._build_chunk(chunks, current_parts))
-
-        with self._lock:
-            self._chunks[document_id] = chunks
+            chunks.append(self._build_chunk(len(chunks), current_parts))
 
         return chunks
 
-    def _build_chunk(
-        self, existing_chunks: list[dict[str, Any]], elements: list[dict[str, Any]]
-    ) -> dict[str, Any]:
+    def _build_chunk(self, chunk_index: int, elements: list[dict[str, Any]]) -> dict[str, Any]:
         content = "\n\n".join(item["content"] for item in elements)
         first_page = next((item["page"] for item in elements if item["page"]), None)
         kind = "table" if any(item["kind"] == "table" for item in elements) else "text"
-        chunk_index = len(existing_chunks)
         return {
             "id": f"chunk-{chunk_index + 1}",
             "chunk_index": chunk_index,
@@ -388,166 +380,156 @@ class IngestionService:
             "summary": None,
         }
 
-    def _finalize_chunking(
-        self, document_id: str, atomic_elements: int, chunk_count: int
-    ) -> None:
-        with self._lock:
-            document = self._documents[document_id]
-            document["chunk_count"] = chunk_count
-            document["updated_at"] = _utc_now()
-            document["detail_log"].append(
-                f"[{document['updated_at']}] Chunked {atomic_elements} elements into {chunk_count} chunks"
-            )
-            self._set_stage_locked(
-                document,
-                "chunking",
-                status="completed",
-                detail="Step completed successfully",
-                progress_current=chunk_count,
-                progress_total=chunk_count,
-            )
-
-    def _summarize_chunks(self, document_id: str) -> None:
-        with self._lock:
-            chunks = self._chunks[document_id]
-            document = self._documents[document_id]
-            total = len(chunks)
-            self._set_stage_locked(
-                document,
-                "summarisation",
-                progress_current=0,
-                progress_total=total,
-            )
-
+    def _summarize_chunks(self, document: dict[str, Any], chunks: list[dict[str, Any]]) -> None:
+        total = len(chunks)
         for index, chunk in enumerate(chunks, start=1):
             chunk["summary"] = _summarize_text(chunk["content"])
-            with self._lock:
-                document = self._documents[document_id]
-                self._set_stage_locked(
-                    document,
-                    "summarisation",
-                    progress_current=index,
-                    progress_total=total,
-                    detail="Processing chunks and creating concise summaries",
-                )
-
-        with self._lock:
-            document = self._documents[document_id]
-            document["summary_count"] = len(chunks)
-            document["updated_at"] = _utc_now()
-            document["detail_log"].append(
-                f"[{document['updated_at']}] Summarised {len(chunks)} chunks"
-            )
-            self._set_stage_locked(
-                document,
-                "summarisation",
-                status="completed",
-                detail="Step completed successfully",
-                progress_current=len(chunks),
-                progress_total=len(chunks),
-            )
-
-    def _vectorize_document(self, document_id: str) -> None:
-        with self._lock:
-            document = self._documents[document_id]
-            provider = document["provider"]
-            filename = document["filename"]
-            chunks = list(self._chunks[document_id])
-            total = len(chunks)
-            self._set_stage_locked(
-                document,
-                "vectorization",
-                progress_current=0,
+            self.supabase.insert_document_event(
+                document_id=document["id"],
+                stage_key="summarisation",
+                stage_label="Summarisation",
+                status="running",
+                detail="Processing chunks and creating concise summaries",
+                progress_current=index,
                 progress_total=total,
             )
 
+    def _vectorize_document(self, document: dict[str, Any], chunks: list[dict[str, Any]]) -> None:
+        provider = document["provider"]
         embeddings, _, _ = build_embeddings_for_provider(provider)
-        db_path = get_primary_db_path()
-        collection_name = get_chroma_collection_name(provider)
-        vector_store = Chroma(
-            persist_directory=str(db_path),
-            embedding_function=embeddings,
-            collection_name=collection_name,
-            collection_metadata={"hnsw:space": "cosine"},
-        )
 
-        documents: list[Document] = []
-        ids: list[str] = []
-        for chunk in chunks:
+        db_chunks: list[dict[str, Any]] = []
+        now = utc_now()
+        texts = [chunk["content"] for chunk in chunks]
+        embedding_vectors = embeddings.embed_documents(texts) if texts else []
+
+        vector_documents: list[Document] = []
+        vector_ids: list[str] = []
+        if not USE_SUPABASE_VECTORS:
+            db_path = get_primary_db_path()
+            collection_name = get_chroma_collection_name(provider)
+            vector_store = Chroma(
+                persist_directory=str(db_path),
+                embedding_function=embeddings,
+                collection_name=collection_name,
+                collection_metadata={"hnsw:space": "cosine"},
+            )
+        else:
+            collection_name = "supabase_pgvector"
+
+        for index, chunk in enumerate(chunks):
+            vector_id = f"{document['id']}:{chunk['chunk_index']}"
             raw_payload = json.dumps(
                 {
                     "raw_text": chunk["content"],
                     "summary": chunk["summary"],
                 }
             )
-            documents.append(
-                Document(
-                    page_content=chunk["content"],
-                    metadata={
-                        "source": filename,
-                        "page": chunk["page"],
-                        "chunk_index": chunk["chunk_index"],
-                        "kind": chunk["kind"],
-                        "original_content": raw_payload,
-                    },
+            if not USE_SUPABASE_VECTORS:
+                vector_documents.append(
+                    Document(
+                        page_content=chunk["content"],
+                        metadata={
+                            "source": document["filename"],
+                            "page": chunk["page"],
+                            "chunk_index": chunk["chunk_index"],
+                            "kind": chunk["kind"],
+                            "original_content": raw_payload,
+                        },
+                    )
                 )
+                vector_ids.append(vector_id)
+            db_chunks.append(
+                {
+                    "id": new_uuid(),
+                    "document_id": document["id"],
+                    "chunk_index": chunk["chunk_index"],
+                    "kind": chunk["kind"],
+                    "page_number": chunk["page"],
+                    "char_count": chunk["char_count"],
+                    "content": chunk["content"],
+                    "summary": chunk["summary"],
+                    "vector_id": vector_id,
+                    "embedding": embedding_vectors[index] if index < len(embedding_vectors) else None,
+                    "created_at": now,
+                }
             )
-            ids.append(f"{document_id}:{chunk['chunk_index']}")
 
-        if documents:
-            vector_store.add_documents(documents=documents, ids=ids)
-
+        if vector_documents and not USE_SUPABASE_VECTORS:
+            vector_store.add_documents(documents=vector_documents, ids=vector_ids)
+        self.supabase.replace_document_chunks(document["id"], db_chunks)
         get_rag_service.cache_clear()
 
-        with self._lock:
-            document = self._documents[document_id]
-            document["vectorized_count"] = len(documents)
-            document["updated_at"] = _utc_now()
-            document["detail_log"].append(
-                f"[{document['updated_at']}] Stored {len(documents)} chunks in collection '{collection_name}'"
-            )
-            self._set_stage_locked(
-                document,
-                "vectorization",
-                status="completed",
-                detail="Step completed successfully",
-                progress_current=len(documents),
-                progress_total=len(documents),
-            )
-
     def _mark_stage(
-        self, document_id: str, key: str, status: str, detail: str | None = None
-    ) -> None:
-        with self._lock:
-            document = self._documents[document_id]
-            document["current_stage"] = key
-            document["updated_at"] = _utc_now()
-            self._set_stage_locked(document, key, status=status, detail=detail)
-
-    def _set_stage_locked(
         self,
         document: dict[str, Any],
         key: str,
-        status: str | None = None,
+        status: str,
         detail: str | None = None,
-        progress_current: int | None = None,
-        progress_total: int | None = None,
+        progress_current: int = 0,
+        progress_total: int = 0,
     ) -> None:
-        for stage in document["stages"]:
-            if stage["key"] != key:
-                continue
-            if status is not None:
-                stage["status"] = status
-            if detail is not None:
-                stage["detail"] = detail
-            if progress_current is not None:
-                stage["progress_current"] = progress_current
-            if progress_total is not None:
-                stage["progress_total"] = progress_total
-            break
+        next_status = document["status"]
+        if status == "failed":
+            next_status = "failed"
+        elif key == "queued" and status in {"running", "completed"}:
+            next_status = "queued"
+        elif status == "completed" and key == "vectorization":
+            next_status = "processing"
+        elif status == "running":
+            next_status = "processing"
 
-    def _serialize_document(self, document: dict[str, Any]) -> DocumentPipeline:
-        return DocumentPipeline(**document)
+        self.supabase.update_document(
+            document["id"],
+            document["user_id"],
+            {
+                "current_stage": key,
+                "status": next_status,
+            },
+        )
+        document["current_stage"] = key
+        document["status"] = next_status
+        self.supabase.insert_document_event(
+            document_id=document["id"],
+            stage_key=key,
+            stage_label=self._stage_label(key),
+            status=status,
+            detail=detail,
+            progress_current=progress_current,
+            progress_total=progress_total,
+        )
+
+    def _events_by_document(self, document_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
+        events = self.supabase.list_document_events(document_ids)
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for event in events:
+            grouped.setdefault(event["document_id"], []).append(event)
+        return grouped
+
+    def _chunks_by_document(self, document_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for document_id in document_ids:
+            grouped[document_id] = self.supabase.list_document_chunks(document_id)
+        return grouped
+
+    def _build_pipeline_from_row(self, document: dict[str, Any]) -> DocumentPipeline:
+        events_by_document = self._events_by_document([document["id"]])
+        chunks_by_document = self._chunks_by_document([document["id"]])
+        return self.supabase.build_document_pipeline(
+            document,
+            events_by_document.get(document["id"], []),
+            chunks_by_document.get(document["id"], []),
+        )
+
+    def _find_document_any_owner(self, document_id: str) -> dict[str, Any] | None:
+        rows = self.supabase.list_documents_for_processing(document_id)
+        return rows[0] if rows else None
+
+    def _stage_label(self, key: str) -> str:
+        for stage_key, label in STAGE_DEFINITIONS:
+            if stage_key == key:
+                return label
+        return key
 
 
 _SERVICE = IngestionService()

@@ -18,6 +18,10 @@ APP_ENV = os.getenv("APP_ENV", "development").strip().lower()
 REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "false").strip().lower() == "true"
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "").strip()
+SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY", "").strip()
+SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "documents").strip()
+USE_SUPABASE_VECTORS = os.getenv("USE_SUPABASE_VECTORS", "false").strip().lower() == "true"
+SUPABASE_VECTOR_RPC_NAME = os.getenv("SUPABASE_VECTOR_RPC_NAME", "match_document_chunks").strip()
 SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "").strip()
 SUPABASE_JWT_ALGORITHM = os.getenv("SUPABASE_JWT_ALGORITHM", "HS256").strip()
 GROQ_MODEL_NAME = os.getenv("GROQ_MODEL_NAME", "groq/compound-mini")

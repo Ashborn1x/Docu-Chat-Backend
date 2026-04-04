@@ -11,6 +11,11 @@ class ChatRequest(BaseModel):
     history: list[ChatMessage] = Field(default_factory=list)
     top_k: int = Field(default=4, ge=1, le=8)
     provider: str | None = Field(default=None)
+    session_id: str | None = Field(default=None)
+
+
+class ChatSessionRename(BaseModel):
+    title: str = Field(..., min_length=1, max_length=100)
 
 
 class SourceItem(BaseModel):
@@ -20,9 +25,33 @@ class SourceItem(BaseModel):
 
 
 class ChatResponse(BaseModel):
+    session_id: str
     answer: str
     rewritten_query: str
     sources: list[SourceItem]
+
+
+class ChatSessionMessage(BaseModel):
+    id: str
+    session_id: str
+    user_id: str
+    role: str
+    content: str
+    rewritten_query: str | None = None
+    message_order: int
+    model_name: str | None = None
+    created_at: str
+
+
+class ChatSession(BaseModel):
+    id: str
+    user_id: str
+    title: str | None = None
+    provider: str
+    last_message_at: str
+    created_at: str
+    updated_at: str
+    messages: list[ChatSessionMessage] = Field(default_factory=list)
 
 
 class HealthResponse(BaseModel):

@@ -15,6 +15,7 @@ from ..config import (
     GEMINI_EMBEDDING_MODEL_NAME,
     GEMINI_MODEL_NAME,
     GROQ_MODEL_NAME,
+    USE_SUPABASE_VECTORS,
     get_chroma_collection_name,
     get_db_candidates,
     get_gemini_api_keys,
@@ -22,6 +23,7 @@ from ..config import (
     normalize_ai_provider,
     resolve_embedding_model,
 )
+from .supabase_service import get_supabase_service
 
 
 @dataclass
@@ -183,8 +185,11 @@ class RagService:
             self.embedding_model_name,
             self.embedding_provider,
         ) = build_embeddings_for_provider(self.provider)
-        self.db_path = self._resolve_db_path()
-        self.db = self._open_db(self.db_path)
+        self.db_path = None
+        self.db = None
+        if not USE_SUPABASE_VECTORS:
+            self.db_path = self._resolve_db_path()
+            self.db = self._open_db(self.db_path)
         self.llm, self.chat_model_name = self._build_chat_model()
 
     def _build_embeddings(self) -> tuple[Any, str]:
@@ -302,11 +307,54 @@ class RagService:
             f"Context:\n{context}"
         )
 
+    def _retrieve_documents(
+        self,
+        query: str,
+        *,
+        top_k: int,
+        user_id: str | None,
+    ) -> list[Document]:
+        if not USE_SUPABASE_VECTORS:
+            return self.db.similarity_search(query, k=max(1, min(top_k, 8)))
+
+        if not user_id:
+            raise ValueError("User id is required when using Supabase vector retrieval.")
+
+        query_embedding = self.embedding_model.embed_query(query)
+        rows = get_supabase_service().match_document_chunks(
+            query_embedding=query_embedding,
+            user_id=user_id,
+            provider=self.provider,
+            match_count=max(1, min(top_k, 8)),
+        )
+        docs: list[Document] = []
+        for row in rows:
+            raw_payload = json.dumps(
+                {
+                    "raw_text": row.get("content", ""),
+                    "summary": row.get("summary"),
+                }
+            )
+            docs.append(
+                Document(
+                    page_content=row.get("content", ""),
+                    metadata={
+                        "source": row.get("source", "Indexed document"),
+                        "page": row.get("page_number"),
+                        "chunk_index": row.get("chunk_index"),
+                        "kind": row.get("kind"),
+                        "original_content": raw_payload,
+                    },
+                )
+            )
+        return docs
+
     def ask(
         self,
         question: str,
         history: list[dict[str, str]] | None = None,
         top_k: int = DEFAULT_TOP_K,
+        user_id: str | None = None,
     ) -> ChatResult:
         clean_question = question.strip()
         if not clean_question:
@@ -314,7 +362,11 @@ class RagService:
 
         history = history or []
         rewritten_query = self._rewrite_question(clean_question, history)
-        docs = self.db.similarity_search(rewritten_query, k=max(1, min(top_k, 8)))
+        docs = self._retrieve_documents(
+            rewritten_query,
+            top_k=top_k,
+            user_id=user_id,
+        )
         sources = _build_sources(docs)
 
         prompt = self._answer_prompt(clean_question, docs)
@@ -347,10 +399,12 @@ async def ask_async(
     history: list[dict[str, str]] | None = None,
     top_k: int = DEFAULT_TOP_K,
     provider: str | None = None,
+    user_id: str | None = None,
 ) -> ChatResult:
     return await asyncio.to_thread(
         get_rag_service(provider).ask,
         question,
         history,
         top_k,
+        user_id,
     )

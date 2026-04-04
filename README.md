@@ -49,13 +49,17 @@ Create `python-backend/.env` if you want backend-specific values. You can start 
 - `REQUIRE_AUTH=false`
 - `SUPABASE_URL`
 - `SUPABASE_ANON_KEY`
-- `SUPABASE_JWT_SECRET`
-- `SUPABASE_JWT_ALGORITHM=HS256`
+- `SUPABASE_SECRET_KEY`
+- `SUPABASE_STORAGE_BUCKET=documents`
+- `USE_SUPABASE_VECTORS=false`
+- `SUPABASE_VECTOR_RPC_NAME=match_document_chunks`
 - `RATE_LIMIT_PER_MINUTE=30`
 - `MAX_UPLOAD_SIZE_MB=20`
 - `ALLOWED_UPLOAD_EXTENSIONS=pdf,csv,docx,txt`
 
-With `REQUIRE_AUTH=true`, protected routes require a Bearer token and the backend expects a confirmed email in the token claims.
+With `REQUIRE_AUTH=true`, protected routes require a Bearer token and the backend expects a confirmed email on the authenticated Supabase user.
+
+To migrate production retrieval away from local Chroma, run the SQL in `python-backend/supabase_pgvector_migration.sql` and then set `USE_SUPABASE_VECTORS=true`.
 
 ### Groq profile
 
