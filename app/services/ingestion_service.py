@@ -68,7 +68,7 @@ class IngestionService:
         self.supabase = get_supabase_service()
 
     def create_document(
-        self, upload: UploadFile, provider: str, user_id: str
+        self, upload: UploadFile, provider: str, user_id: str, session_id: str | None
     ) -> DocumentPipeline:
         document_id = new_uuid()
         safe_name = _slugify_filename(upload.filename or "document")
@@ -82,6 +82,7 @@ class IngestionService:
             {
                 "id": document_id,
                 "user_id": user_id,
+                "chat_session_id": session_id,
                 "filename": upload.filename or safe_name,
                 "storage_key": storage_key,
                 "storage_bucket": SUPABASE_STORAGE_BUCKET,
@@ -91,6 +92,12 @@ class IngestionService:
                 "status": "queued",
                 "current_stage": "queued",
                 "error_message": None,
+                "text_sections": 0,
+                "tables": 0,
+                "images": 0,
+                "titles_headers": 0,
+                "other_elements": 0,
+                "atomic_elements": 0,
                 "created_at": created_at,
                 "updated_at": created_at,
             }
@@ -115,10 +122,10 @@ class IngestionService:
         )
         return self._build_pipeline_from_row(document)
 
-    def list_documents_for_user(self, user_id: str | None) -> list[DocumentPipeline]:
+    def list_documents_for_user(self, user_id: str | None, session_id: str | None = None) -> list[DocumentPipeline]:
         if not user_id:
             return []
-        documents = self.supabase.list_documents(user_id)
+        documents = self.supabase.list_documents(user_id, session_id=session_id)
         events_by_document = self._events_by_document([document["id"] for document in documents])
         chunk_counts = self._chunks_by_document([document["id"] for document in documents])
         return [
@@ -172,6 +179,11 @@ class IngestionService:
         self.supabase.delete_document(document_id, user_id)
         get_rag_service.cache_clear()
 
+    def delete_documents_for_session(self, session_id: str, user_id: str) -> None:
+        documents = self.supabase.list_documents(user_id, session_id=session_id)
+        for document in documents:
+            self.delete_document(document["id"], user_id)
+
     def process_document(self, document_id: str) -> None:
         document = None
         try:
@@ -187,6 +199,18 @@ class IngestionService:
                 "Processing and extracting text, images, and tables",
             )
             elements, counts = self._partition_document(document)
+            self.supabase.update_document(
+                document["id"],
+                document["user_id"],
+                {
+                    "text_sections": counts.get("text_sections", 0),
+                    "tables": counts.get("tables", 0),
+                    "images": counts.get("images", 0),
+                    "titles_headers": counts.get("titles_headers", 0),
+                    "other_elements": counts.get("other_elements", 0),
+                    "atomic_elements": len(elements),
+                },
+            )
             self._mark_stage(
                 document,
                 "partitioning",
@@ -434,6 +458,7 @@ class IngestionService:
                             "page": chunk["page"],
                             "chunk_index": chunk["chunk_index"],
                             "kind": chunk["kind"],
+                            "chat_session_id": document.get("chat_session_id"),
                             "original_content": raw_payload,
                         },
                     )

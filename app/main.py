@@ -26,6 +26,7 @@ from .config import (
 from .models import (
     ChatRequest,
     ChatResponse,
+    ChatSessionCreate,
     ChatSession,
     ChatSessionRename,
     DocumentChunkList,
@@ -140,6 +141,7 @@ async def chat(
             top_k=payload.top_k,
             provider=provider,
             user_id=current_user.id,
+            session_id=session_id,
         )
         persisted_session_id = chat_store.persist_chat_round(
             session_id=session_id,
@@ -174,6 +176,21 @@ def list_chats(
     return get_chat_persistence_service().list_chats(current_user)
 
 
+@app.post("/api/chats", response_model=ChatSession)
+def create_chat(
+    payload: ChatSessionCreate,
+    request: Request,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    _enforce_rate_limit(request, current_user, "chats-create")
+    provider = normalize_ai_provider(payload.provider)
+    return get_chat_persistence_service().create_chat(
+        current_user,
+        provider=provider,
+        title=payload.title.strip() or "New Chat",
+    )
+
+
 @app.delete("/api/chats/{session_id}", status_code=204)
 def delete_chat(
     session_id: str,
@@ -181,6 +198,7 @@ def delete_chat(
     current_user: CurrentUser = Depends(get_current_user),
 ):
     _enforce_rate_limit(request, current_user, "chats-delete")
+    get_ingestion_service().delete_documents_for_session(session_id, current_user.id)
     get_chat_persistence_service().delete_chat(session_id, current_user)
 
 
@@ -198,11 +216,12 @@ def rename_chat(
 @app.get("/api/documents", response_model=list[DocumentPipeline])
 def list_documents(
     request: Request,
+    session_id: str | None = Query(default=None),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     _enforce_rate_limit(request, current_user, "documents-list")
     get_supabase_service().ensure_user(current_user.id, current_user.email)
-    return get_ingestion_service().list_documents_for_user(current_user.id)
+    return get_ingestion_service().list_documents_for_user(current_user.id, session_id=session_id)
 
 
 @app.get("/api/documents/{document_id}", response_model=DocumentPipeline)
@@ -250,6 +269,7 @@ async def upload_document(
     request: Request,
     file: UploadFile = File(...),
     provider: str | None = Form(default=None),
+    session_id: str | None = Form(default=None),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     try:
@@ -257,15 +277,22 @@ async def upload_document(
         _validate_upload(file)
         normalized_provider = normalize_ai_provider(provider)
         get_supabase_service().ensure_user(current_user.id, current_user.email)
+        if not session_id:
+            raise HTTPException(status_code=400, detail="A chat session is required before uploading documents.")
+        if not get_chat_persistence_service().get_chat(session_id, current_user):
+            raise HTTPException(status_code=404, detail="Chat not found.")
         document = get_ingestion_service().create_document(
             file,
             normalized_provider,
             current_user.id,
+            session_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except HTTPException:
+        raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail="Upload failed.") from exc
+        raise HTTPException(status_code=500, detail=f"Upload failed: {exc}") from exc
     finally:
         await file.close()
 

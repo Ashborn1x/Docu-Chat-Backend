@@ -313,9 +313,15 @@ class RagService:
         *,
         top_k: int,
         user_id: str | None,
+        session_id: str | None,
     ) -> list[Document]:
         if not USE_SUPABASE_VECTORS:
-            return self.db.similarity_search(query, k=max(1, min(top_k, 8)))
+            filter_payload = {"chat_session_id": session_id} if session_id else None
+            return self.db.similarity_search(
+                query,
+                k=max(1, min(top_k, 8)),
+                filter=filter_payload,
+            )
 
         if not user_id:
             raise ValueError("User id is required when using Supabase vector retrieval.")
@@ -326,6 +332,7 @@ class RagService:
             user_id=user_id,
             provider=self.provider,
             match_count=max(1, min(top_k, 8)),
+            session_id=session_id,
         )
         docs: list[Document] = []
         for row in rows:
@@ -355,6 +362,7 @@ class RagService:
         history: list[dict[str, str]] | None = None,
         top_k: int = DEFAULT_TOP_K,
         user_id: str | None = None,
+        session_id: str | None = None,
     ) -> ChatResult:
         clean_question = question.strip()
         if not clean_question:
@@ -366,6 +374,7 @@ class RagService:
             rewritten_query,
             top_k=top_k,
             user_id=user_id,
+            session_id=session_id,
         )
         sources = _build_sources(docs)
 
@@ -400,6 +409,7 @@ async def ask_async(
     top_k: int = DEFAULT_TOP_K,
     provider: str | None = None,
     user_id: str | None = None,
+    session_id: str | None = None,
 ) -> ChatResult:
     return await asyncio.to_thread(
         get_rag_service(provider).ask,
@@ -407,4 +417,5 @@ async def ask_async(
         history,
         top_k,
         user_id,
+        session_id,
     )

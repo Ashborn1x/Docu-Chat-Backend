@@ -58,8 +58,13 @@ Create `python-backend/.env` if you want backend-specific values. You can start 
 - `ALLOWED_UPLOAD_EXTENSIONS=pdf,csv,docx,txt`
 
 With `REQUIRE_AUTH=true`, protected routes require a Bearer token and the backend expects a confirmed email on the authenticated Supabase user.
+Set `RATE_LIMIT_PER_MINUTE=0` to disable rate limiting entirely.
 
 To migrate production retrieval away from local Chroma, run the SQL in `python-backend/supabase_pgvector_migration.sql` and then set `USE_SUPABASE_VECTORS=true`.
+
+To persist document partition metrics such as text sections, tables, and atomic elements, run the SQL in `python-backend/supabase_document_metrics_migration.sql`.
+
+To scope uploaded documents and retrieval to an individual chat session, run the SQL in `python-backend/supabase_chat_scoped_kb_migration.sql`.
 
 ### Groq profile
 

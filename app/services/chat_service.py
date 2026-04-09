@@ -38,6 +38,11 @@ class ChatPersistenceService:
         self.ensure_user(current_user)
         self.supabase.update_chat_session(session_id, current_user.id, {"title": title})
 
+    def create_chat(self, current_user: CurrentUser, provider: str, title: str = "New Chat") -> ChatSession:
+        self.ensure_user(current_user)
+        session_row = self.supabase.insert_chat_session(current_user.id, title, provider)
+        return ChatSession(**session_row, messages=[])
+
     def persist_chat_round(
         self,
         *,

@@ -302,10 +302,17 @@ class SupabaseService:
             body=fields,
         )
 
-    def list_documents(self, user_id: str) -> list[dict[str, Any]]:
+    def list_documents(self, user_id: str, session_id: str | None = None) -> list[dict[str, Any]]:
+        params = {
+            "select": "*",
+            "user_id": f"eq.{user_id}",
+            "order": "created_at.desc",
+        }
+        if session_id:
+            params["chat_session_id"] = f"eq.{session_id}"
         return _request_json(
             "GET",
-            f"{self.rest_url}/documents{_encode_query({'select': '*', 'user_id': f'eq.{user_id}', 'order': 'created_at.desc'})}",
+            f"{self.rest_url}/documents{_encode_query(params)}",
             headers=_json_headers(),
             expected_statuses=(200,),
         ) or []
@@ -415,17 +422,21 @@ class SupabaseService:
         user_id: str,
         provider: str,
         match_count: int,
+        session_id: str | None = None,
     ) -> list[dict[str, Any]]:
+        body = {
+            "query_embedding": query_embedding,
+            "match_count": match_count,
+            "filter_user_id": user_id,
+            "filter_provider": provider,
+        }
+        if session_id:
+            body["filter_session_id"] = session_id
         return _request_json(
             "POST",
             f"{self.rest_url}/rpc/{SUPABASE_VECTOR_RPC_NAME}",
             headers=_json_headers(),
-            body={
-                "query_embedding": query_embedding,
-                "match_count": match_count,
-                "filter_user_id": user_id,
-                "filter_provider": provider,
-            },
+            body=body,
             expected_statuses=(200,),
         ) or []
 
@@ -459,6 +470,7 @@ class SupabaseService:
         return DocumentPipeline(
             id=document["id"],
             user_id=document["user_id"],
+            chat_session_id=document.get("chat_session_id"),
             filename=document["filename"],
             provider=document["provider"],
             status=document["status"],
@@ -468,8 +480,14 @@ class SupabaseService:
             updated_at=document["updated_at"],
             error=document.get("error_message"),
             stages=list(stages_by_key.values()),
-            partition_counts=PartitionCounts(),
-            atomic_elements=0,
+            partition_counts=PartitionCounts(
+                text_sections=document.get("text_sections") or 0,
+                tables=document.get("tables") or 0,
+                images=document.get("images") or 0,
+                titles_headers=document.get("titles_headers") or 0,
+                other_elements=document.get("other_elements") or 0,
+            ),
+            atomic_elements=document.get("atomic_elements") or 0,
             chunk_count=chunk_count,
             summary_count=summary_count,
             vectorized_count=vectorized_count,

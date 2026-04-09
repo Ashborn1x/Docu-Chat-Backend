@@ -18,6 +18,11 @@ class ChatSessionRename(BaseModel):
     title: str = Field(..., min_length=1, max_length=100)
 
 
+class ChatSessionCreate(BaseModel):
+    title: str = Field(default="New Chat", min_length=1, max_length=100)
+    provider: str | None = Field(default=None)
+
+
 class SourceItem(BaseModel):
     id: int
     source: str
@@ -86,6 +91,7 @@ class PartitionCounts(BaseModel):
 class DocumentPipeline(BaseModel):
     id: str
     user_id: str
+    chat_session_id: str | None = None
     filename: str
     provider: str
     status: str

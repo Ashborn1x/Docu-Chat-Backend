@@ -15,12 +15,15 @@ class RateLimitWindow:
 
 class InMemoryRateLimiter:
     def __init__(self, limit_per_minute: int) -> None:
-        self.limit_per_minute = max(1, limit_per_minute)
+        self.limit_per_minute = max(0, limit_per_minute)
         self.window_seconds = 60
         self._buckets: dict[str, RateLimitWindow] = {}
         self._lock = Lock()
 
     def check(self, key: str) -> None:
+        if self.limit_per_minute <= 0:
+            return
+
         now = time()
         cutoff = now - self.window_seconds
 
